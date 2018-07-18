@@ -59,12 +59,20 @@ inline Engine* CreateEngine() {
 }  // namespace engine
 
 std::shared_ptr<Engine> Engine::_GetSharedRef() {
+#ifndef MXNET_THREAD_LOACL_ENGINE
   static std::shared_ptr<Engine> sptr(engine::CreateEngine());
+#else
+  static thread_local std::shared_ptr<Engine> sptr(engine::CreateEngine());
+#endif
   return sptr;
 }
 
 Engine* Engine::Get() {
+#ifndef MXNET_THREAD_LOACL_ENGINE
   static Engine *inst = _GetSharedRef().get();
+#else
+  static thread_local Engine *inst = _GetSharedRef().get();
+#endif
   return inst;
 }
 }  // namespace mxnet
