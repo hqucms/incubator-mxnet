@@ -26,6 +26,7 @@
 #include "../3rdparty/dmlc-core/src/io/recordio_split.cc"
 #include "../3rdparty/dmlc-core/src/io/indexed_recordio_split.cc"
 #include "../3rdparty/dmlc-core/src/io/input_split_base.cc"
+#include "../3rdparty/dmlc-core/src/io/filesys.cc"
 #include "../3rdparty/dmlc-core/src/io/local_filesys.cc"
 #include "../3rdparty/dmlc-core/src/data.cc"
 #include "../3rdparty/dmlc-core/src/io.cc"
