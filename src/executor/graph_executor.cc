@@ -1466,6 +1466,10 @@ void GraphExecutor::ExecuteMonCallback(size_t nid) {
 }
 
 void GraphExecutor::RunOps(bool is_train, size_t topo_start, size_t topo_end) {
+  // Update resource
+  auto g = AttachOpResources(graph_);
+  graph_ = std::move(g);
+
   // Update context
   const auto& idx = graph_.indexed_graph();
   for (size_t nid = topo_start; nid < topo_end; ++nid) {
