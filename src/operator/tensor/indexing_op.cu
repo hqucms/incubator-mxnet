@@ -463,6 +463,44 @@ inline void GatherNDBackwardImpl(index_t N, index_t M, index_t K,
   mxnet_op::Kernel<backward_gather_nd_gpu, gpu>::Launch(s, N, N, M, K, strides, out, data, indices);
 }
 
+// -----
+struct backward_gather_nn_gpu {
+  template<typename DType, typename IType>
+  MSHADOW_XINLINE static void Map(index_t i, index_t C, index_t P, index_t K,
+                                  index_t CP, index_t PK,
+                                  DType* out, const DType* data,
+                                  const IType* indices) {
+    index_t iCP = i * CP;
+    index_t iPK = i * PK;
+    for (index_t j = 0; j < C; ++j){
+      index_t iCP_jP = iCP + j*P;
+      index_t iCPK_jPK = iCP_jP * K;
+      for (index_t p = 0; p < P; ++p){
+        index_t pK = p * K;
+        index_t iCPK_jPK_pK = iCPK_jPK + pK;
+        index_t iPK_pK = iPK + pK;
+        for (index_t k = 0; k < K; ++k){
+          index_t ind_k = static_cast<index_t>(indices[iPK_pK + k]);
+          atomicAdd(out[iCP_jP + ind_k], data[iCPK_jPK_pK + k]);
+        }
+      }
+    }
+  }
+};
+
+template<typename DType, typename IType>
+inline void GatherNNBackwardImpl(index_t N, index_t C, index_t P, index_t K,
+                                 index_t CP, index_t PK,
+                                 DType* out,
+                                 const DType* data,
+                                 const IType* indices,
+                                 mshadow::Stream<gpu> *s) {
+  mxnet_op::Kernel<backward_gather_nn_gpu, gpu>::Launch(s, N, C, P, K, C*P, P*K, out, data, indices);
+}
+
+// -----
+
+
 template<>
 void TakeOpForward<gpu>(const nnvm::NodeAttrs& attrs,
                         const OpContext& ctx,
@@ -566,5 +604,12 @@ NNVM_REGISTER_OP(_backward_gather_nd)
 
 NNVM_REGISTER_OP(_scatter_set_nd)
 .set_attr<FCompute>("FCompute<gpu>", ScatterSetNDForward<gpu>);
+
+NNVM_REGISTER_OP(gather_nn)
+.set_attr<FCompute>("FCompute<gpu>", GatherNNForward<gpu>);
+
+NNVM_REGISTER_OP(_backward_gather_nn)
+.set_attr<FCompute>("FCompute<gpu>", GatherNNBackward<gpu>);
+
 }  // namespace op
 }  // namespace mxnet
