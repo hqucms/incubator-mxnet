@@ -481,7 +481,7 @@ struct backward_gather_nn_gpu {
         index_t iPK_pK = iPK + pK;
         for (index_t k = 0; k < K; ++k){
           index_t ind_k = static_cast<index_t>(indices[iPK_pK + k]);
-          atomicAdd(out[iCP_jP + ind_k], data[iCPK_jPK_pK + k]);
+          atomicAdd(out + (iCP_jP + ind_k), data[iCPK_jPK_pK + k]);
         }
       }
     }

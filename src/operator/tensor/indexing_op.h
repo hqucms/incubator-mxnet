@@ -1347,8 +1347,11 @@ inline bool GatherNNShape(const nnvm::NodeAttrs& attrs,
 
   if (shape_is_none(dshape) || shape_is_none(ishape)) return false;
 
-  CHECK_GT(ishape.ndim(), 1)
-    << "gather_nn requires index tensor to have at least 2 dimensions";
+  CHECK_EQ(dshape.ndim(), 3)
+    << "gather_nn requires data tensor to have 3 dimensions";
+
+  CHECK_EQ(ishape.ndim(), 3)
+    << "gather_nn requires index tensor to have 3 dimensions";
 
   CHECK_EQ(ishape[0], dshape[0])
     << "Batch size does not match";
