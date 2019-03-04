@@ -414,6 +414,43 @@ inline void GatherNDBackwardImpl(int N, int M, int K,
   mxnet_op::Kernel<backward_gather_nd_gpu, gpu>::Launch(s, N, N, M, K, strides, out, data, indices);
 }
 
+// -----
+struct backward_gather_nn_gpu {
+  template<typename DType, typename IType>
+  MSHADOW_XINLINE static void Map(int i, int C, int P, int K,
+                                  int CP, int PK,
+                                  DType* out, const DType* data,
+                                  const IType* indices) {
+    int iCP = i * CP;
+    int iPK = i * PK;
+    for (int j = 0; j < C; ++j){
+      int iCP_jP = iCP + j*P;
+      int iCPK_jPK = iCP_jP * K;
+      for (int p = 0; p < P; ++p){
+        int pK = p * K;
+        int iCPK_jPK_pK = iCPK_jPK + pK;
+        int iPK_pK = iPK + pK;
+        for (int k = 0; k < K; ++k){
+          int ind_k = static_cast<int>(indices[iPK_pK + k]);
+          atomicAdd(out + (iCP_jP + ind_k), data[iCPK_jPK_pK + k]);
+        }
+      }
+    }
+  }
+};
+
+template<typename DType, typename IType>
+inline void GatherNNBackwardImpl(int N, int C, int P, int K,
+                                 int CP, int PK,
+                                 DType* out,
+                                 const DType* data,
+                                 const IType* indices,
+                                 mshadow::Stream<gpu> *s) {
+  mxnet_op::Kernel<backward_gather_nn_gpu, gpu>::Launch(s, N, C, P, K, C*P, P*K, out, data, indices);
+}
+
+// -----
+
 NNVM_REGISTER_OP(Embedding)
 .set_attr<FCompute>("FCompute<gpu>", EmbeddingOpForward<gpu>)
 .set_attr<FComputeEx>("FComputeEx<gpu>", SparseEmbeddingOpForwardEx<gpu>);
@@ -451,5 +488,12 @@ NNVM_REGISTER_OP(_backward_gather_nd)
 
 NNVM_REGISTER_OP(_scatter_set_nd)
 .set_attr<FCompute>("FCompute<gpu>", ScatterSetNDForward<gpu>);
+
+NNVM_REGISTER_OP(gather_nn)
+.set_attr<FCompute>("FCompute<gpu>", GatherNNForward<gpu>);
+
+NNVM_REGISTER_OP(_backward_gather_nn)
+.set_attr<FCompute>("FCompute<gpu>", GatherNNBackward<gpu>);
+
 }  // namespace op
 }  // namespace mxnet

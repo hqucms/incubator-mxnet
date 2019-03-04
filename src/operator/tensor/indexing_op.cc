@@ -206,11 +206,72 @@ GatherNDBackwardImpl(int N, int M, int K,
   }
 }
 
+// -----
+
+template<typename DType, typename IType>
+inline typename std::enable_if<(!std::is_same<DType, mshadow::half::half_t>::value), void>::type
+GatherNNBackwardImpl(int N, int C, int P, int K,
+                     int CP, int PK,
+                     DType* out,
+                     const DType* data,
+                     const IType* indices,
+                     mshadow::Stream<cpu> *s) {
+#pragma omp parallel for
+  for (int i = 0; i < N; i++) {
+    int iCP = i * CP;
+    int iPK = i * PK;
+    for (int j = 0; j < C; ++j){
+      int iCP_jP = iCP + j*P;
+      int iCPK_jPK = iCP_jP * K;
+      for (int p = 0; p < P; ++p){
+        int pK = p * K;
+        int iCPK_jPK_pK = iCPK_jPK + pK;
+        int iPK_pK = iPK + pK;
+        for (int k = 0; k < K; ++k){
+          int ind_k = static_cast<int>(indices[iPK_pK + k]);
+#pragma omp atomic
+          out[iCP_jP + ind_k] += data[iCPK_jPK_pK + k];
+        }
+      }
+    }
+  }
+}
+
+template<typename DType, typename IType>
+inline typename std::enable_if<std::is_same<DType, mshadow::half::half_t>::value, void>::type
+GatherNNBackwardImpl(int N, int C, int P, int K,
+                     int CP, int PK,
+                     DType* out,
+                     const DType* data,
+                     const IType* indices,
+                     mshadow::Stream<cpu> *s) {
+  for (int i = 0; i < N; i++) {
+    int iCP = i * CP;
+    int iPK = i * PK;
+    for (int j = 0; j < C; ++j){
+      int iCP_jP = iCP + j*P;
+      int iCPK_jPK = iCP_jP * K;
+      for (int p = 0; p < P; ++p){
+        int pK = p * K;
+        int iCPK_jPK_pK = iCPK_jPK + pK;
+        int iPK_pK = iPK + pK;
+        for (int k = 0; k < K; ++k){
+          int ind_k = static_cast<int>(indices[iPK_pK + k]);
+          out[iCP_jP + ind_k] += data[iCPK_jPK_pK + k];
+        }
+      }
+    }
+  }
+}
+// -----
+
+
 DMLC_REGISTER_PARAMETER(EmbeddingParam);
 DMLC_REGISTER_PARAMETER(SparseEmbeddingParam);
 DMLC_REGISTER_PARAMETER(TakeParam);
 DMLC_REGISTER_PARAMETER(OneHotParam);
 DMLC_REGISTER_PARAMETER(ScatterNDParam);
+DMLC_REGISTER_PARAMETER(GatherNNBackwardParam);
 
 NNVM_REGISTER_OP(Embedding)
 MXNET_ADD_SPARSE_OP_ALIAS(Embedding)
@@ -813,6 +874,118 @@ Examples::
 .add_argument("rhs", "NDArray-or-Symbol", "value to assign")
 .add_argument("indices", "NDArray-or-Symbol", "indices")
 .add_arguments(ScatterNDParam::__FIELDS__());
+
+// -----
+NNVM_REGISTER_OP(gather_nn)
+.describe(R"code(Gather elements from `data` according to `indices`.
+
+Given `data` with shape `(N, C, P)` and indices with shape
+`(N, P, K)`, the output will have shape `(N, C, P, K)`.
+
+The elements in output is defined as follows::
+
+  output[i, j, p, k] = data[i, j, indices[i, j, k]]
+
+Examples::
+
+  data = [[0, 1], [2, 3]]
+  indices = [[1, 1, 0], [0, 1, 0]]
+  gather_nd(data, indices) = [2, 3, 0]
+
+  data = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+  indices = [[0, 1], [1, 0]]
+  gather_nd(data, indices) = [[3, 4], [5, 6]]
+
+)code")
+.set_num_outputs(1)
+.set_num_inputs(2)
+.set_attr<nnvm::FListInputNames>("FListInputNames",
+  [](const NodeAttrs& attrs) {
+    return std::vector<std::string>{"data", "indices"};
+  })
+.set_attr<nnvm::FInferShape>("FInferShape", GatherNNShape)
+.set_attr<nnvm::FInferType>("FInferType", GatherNNType)
+.set_attr<FCompute>("FCompute<cpu>", GatherNNForward<cpu>)
+.set_attr<nnvm::FGradient>("FGradient",
+  [](const nnvm::NodePtr& n, const std::vector<nnvm::NodeEntry>& ograds) {
+    auto p = nnvm::Node::Create();
+    p->attrs.op = nnvm::Op::Get("_backward_gather_nn");
+    p->attrs.name = n->attrs.name + "_backward";
+    p->inputs.push_back(ograds[0]);
+    p->inputs.push_back(n->inputs[1]);
+    p->control_deps.emplace_back(n);
+    auto zero = MakeNode("zeros_like", n->attrs.name + "_backward_indices",
+                         {n->inputs[1]}, nullptr, &n);
+
+    std::vector<nnvm::NodeEntry> ret;
+    ret.emplace_back(nnvm::NodeEntry{p, 0, 0});
+    ret.emplace_back(nnvm::NodeEntry{zero, 0, 0});
+    return ret;
+  })
+.set_attr<nnvm::TIsBackward>("TIsBackward", true)
+.add_argument("data", "NDArray-or-Symbol", "data")
+.add_argument("indices", "NDArray-or-Symbol", "indices");
+
+NNVM_REGISTER_OP(_backward_gather_nn)
+.describe(R"code(Accumulates data according to indices and get the result. It's the backward of
+`gather_nn`.
+
+Given `data` with shape `(N, C, P, K)` and indices with shape
+`(N, P, K)`, the output will have shape `(N, C, P)`.
+
+The elements in output is defined as follows::
+
+  output[i, j, indices[i, p, k]] += data[i, j, p, k]
+
+all other entries in output are 0 or the original value if AddTo is triggered.
+
+Examples::
+
+  data = [2, 3, 0]
+  indices = [[1, 1, 0], [0, 1, 0]]
+  shape = (2, 2)
+  _backward_gather_nd(data, indices, shape) = [[0, 0], [2, 3]] # Same as scatter_nd
+
+  # The difference between scatter_nd and scatter_nd_acc is the latter will accumulate
+  #  the values that point to the same index.
+
+  data = [2, 3, 0]
+  indices = [[1, 1, 0], [1, 1, 0]]
+  shape = (2, 2)
+  _backward_gather_nd(data, indices, shape) = [[0, 0], [0, 5]]
+
+)code")
+.set_num_outputs(1)
+.set_num_inputs(2)
+.set_attr_parser(ParamParser<GatherNNBackwardParam>)
+.set_attr<nnvm::FListInputNames>("FListInputNames",
+  [](const NodeAttrs& attrs) {
+    return std::vector<std::string>{"data", "indices"};
+  })
+.set_attr<nnvm::FInferShape>("FInferShape", GatherNNBackwardShape)
+.set_attr<nnvm::FInferType>("FInferType", GatherNNBackwardType)
+.set_attr<FCompute>("FCompute<cpu>", GatherNNBackward<cpu>)
+.set_attr<nnvm::FGradient>("FGradient",
+  [](const nnvm::NodePtr& n, const std::vector<nnvm::NodeEntry>& ograds) {
+    auto p = nnvm::Node::Create();
+    p->attrs.op = nnvm::Op::Get("gather_nn");
+    p->attrs.name = n->attrs.name + "_backward";
+    p->inputs.push_back(ograds[0]);
+    p->inputs.push_back(n->inputs[1]);
+    p->control_deps.emplace_back(n);
+    auto zero = MakeNode("zeros_like", n->attrs.name + "_backward_indices",
+                         {n->inputs[1]}, nullptr, &n);
+    std::vector<nnvm::NodeEntry> ret;
+    ret.emplace_back(nnvm::NodeEntry{p, 0, 0});
+    ret.emplace_back(nnvm::NodeEntry{zero, 0, 0});
+    return ret;
+  })
+.set_attr<nnvm::TIsBackward>("TIsBackward", true)
+.add_argument("data", "NDArray-or-Symbol", "data")
+.add_argument("indices", "NDArray-or-Symbol", "indices")
+.add_arguments(GatherNNBackwardParam::__FIELDS__());
+
+// -----
 
 }  // namespace op
 }  // namespace mxnet

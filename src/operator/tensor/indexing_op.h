@@ -1543,6 +1543,208 @@ void ScatterSetNDForward(const nnvm::NodeAttrs& attrs,
   ScatterNDForward<xpu>(attrs, ctx, {inputs[1], inputs[2]}, {kWriteInplace}, outputs);
 }
 
+// -----
+inline bool GatherNNShape(const nnvm::NodeAttrs& attrs,
+                          std::vector<TShape> *in_attrs,
+                          std::vector<TShape> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  // The shape of indices
+  const TShape& dshape = (*in_attrs)[0]; // (N, C, P)
+  const TShape& ishape = (*in_attrs)[1]; // (N, P, K)
+
+  if (shape_is_none(dshape) || shape_is_none(ishape)) return false;
+
+  CHECK_EQ(dshape.ndim(), 3)
+    << "gather_nn requires data tensor to have 3 dimensions";
+
+  CHECK_EQ(ishape.ndim(), 3)
+    << "gather_nn requires index tensor to have 3 dimensions";
+
+  CHECK_EQ(ishape[0], dshape[0])
+    << "Batch size does not match";
+
+  CHECK_EQ(ishape[1], dshape[2])
+    << "# points does not match";
+
+  TShape oshape({dshape[0], dshape[1], dshape[2], ishape[2]}); // (N, C, P, K)
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, oshape);
+  return true;
+}
+
+inline bool GatherNNType(const nnvm::NodeAttrs& attrs,
+                         std::vector<int>* in_attrs,
+                         std::vector<int>* out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  TYPE_ASSIGN_CHECK(*out_attrs, 0, (*in_attrs)[0]);
+  TYPE_ASSIGN_CHECK(*in_attrs, 0, (*out_attrs)[0]);
+  return true;
+}
+
+struct gather_nn {
+  template<typename DType, typename IType>
+  MSHADOW_XINLINE static void Map(int i, OpReqType req, int C, int P, int K,
+                                  int CP, int PK,
+                                  DType* out, const DType* data,
+                                  const IType* indices) {
+    int iCP = i * CP;
+    int iPK = i * PK;
+    for (int j = 0; j < C; ++j){
+      int iCP_jP = iCP + j*P;
+      int iCPK_jPK = iCP_jP * K;
+      for (int p = 0; p < P; ++p){
+        int pK = p * K;
+        int iCPK_jPK_pK = iCPK_jPK + pK;
+        int iPK_pK = iPK + pK;
+        for (int k = 0; k < K; ++k){
+          int ind_k = static_cast<int>(indices[iPK_pK + k]);
+          KERNEL_ASSIGN(out[iCPK_jPK_pK + k], req, data[iCP_jP + ind_k]);
+        }
+      }
+    }
+  }
+};
+
+template<typename xpu>
+void GatherNNForward(const nnvm::NodeAttrs& attrs,
+                     const OpContext& ctx,
+                     const std::vector<TBlob>& inputs,
+                     const std::vector<OpReqType>& req,
+                     const std::vector<TBlob>& outputs) {
+  using namespace mxnet_op;
+  using namespace mshadow;
+  CHECK_EQ(inputs.size(), 2U);
+  CHECK_EQ(outputs.size(), 1U);
+  if (req[0] == kNullOp) return;
+  mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
+  const TShape& dshape = inputs[0].shape_;
+  const TShape& ishape = inputs[1].shape_;
+  int N = dshape[0];
+  int C = dshape[1];
+  int P = dshape[2];
+  int K = ishape[2];
+  MSHADOW_TYPE_SWITCH(inputs[0].type_flag_, DType, {  // output data type switch
+    MSHADOW_TYPE_SWITCH(inputs[1].type_flag_, IType, {  // indices data type switch
+      Kernel<gather_nn, xpu>::Launch(
+          s, N, req[0], C, P, K, C*P, P*K, outputs[0].dptr<DType>(),
+          inputs[0].dptr<DType>(), inputs[1].dptr<IType>());
+    });
+  });
+}
+
+
+struct GatherNNBackwardParam : public dmlc::Parameter<GatherNNBackwardParam> {
+  TShape shape;
+  DMLC_DECLARE_PARAMETER(GatherNNBackwardParam) {
+    DMLC_DECLARE_FIELD(shape)
+      .describe("Shape of output.");
+  }
+};
+
+inline bool GatherNNBackwardShape(const nnvm::NodeAttrs& attrs,
+                           std::vector<TShape> *in_attrs,
+                           std::vector<TShape> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  const auto& params = dmlc::get<GatherNNBackwardParam>(attrs.parsed);
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, params.shape);
+
+  const TShape& dshape = (*in_attrs)[0];  // (N, C, P, K)
+  const TShape& ishape = (*in_attrs)[1];  // (N, P, K)
+  const TShape& oshape = (*out_attrs)[0]; // (N, C, P)
+
+  if (shape_is_none(dshape) || shape_is_none(ishape) || shape_is_none(oshape)) return false;
+
+  CHECK_EQ(ishape.ndim(), 3)
+    << "gather_nn_backward requires index tensor to have 3 dimensions";
+
+  bool valid = (ishape.ndim() == oshape.ndim())
+      && (dshape.ndim() == ishape.ndim() + 1)
+      && (dshape[0] == ishape[0] && dshape[0] == oshape[0])
+      && (dshape[1] == oshape[1])
+      && (dshape[2] == ishape[1] && dshape[0] == oshape[2])
+      && (dshape[3] == ishape[2]);
+
+  CHECK(valid)
+    << "Invalid data, indices, and output shape combination for gather_nn_backward: "
+    << dshape << ", " << ishape << ", " << oshape;
+
+  return true;
+}
+
+inline bool GatherNNBackwardType(const nnvm::NodeAttrs& attrs,
+                          std::vector<int>* in_attrs,
+                          std::vector<int>* out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  TYPE_ASSIGN_CHECK(*out_attrs, 0, (*in_attrs)[0]);
+  TYPE_ASSIGN_CHECK(*in_attrs, 0, (*out_attrs)[0]);
+  return in_attrs->at(0) != -1 && in_attrs->at(1) != -1;
+}
+
+
+template<typename DType, typename IType>
+inline typename std::enable_if<(!std::is_same<DType, mshadow::half::half_t>::value), void>::type
+GatherNNBackwardImpl(int N, int C, int P, int K,
+                     int CP, int PK,
+                     DType* out,
+                     const DType* data,
+                     const IType* indices,
+                     mshadow::Stream<cpu> *s);
+
+template<typename DType, typename IType>
+inline typename std::enable_if<std::is_same<DType, mshadow::half::half_t>::value, void>::type
+GatherNNBackwardImpl(int N, int C, int P, int K,
+                     int CP, int PK,
+                     DType* out,
+                     const DType* data,
+                     const IType* indices,
+                     mshadow::Stream<cpu> *s);
+
+template<typename DType, typename IType>
+inline void GatherNNBackwardImpl(int N, int C, int P, int K,
+                                 int CP, int PK,
+                                 DType* out,
+                                 const DType* data,
+                                 const IType* indices,
+                                 mshadow::Stream<gpu> *s);
+
+template<typename xpu>
+void GatherNNBackward(const nnvm::NodeAttrs& attrs,
+                      const OpContext& ctx,
+                      const std::vector<TBlob>& inputs,
+                      const std::vector<OpReqType>& req,
+                      const std::vector<TBlob>& outputs) {
+  using namespace mshadow;
+  CHECK_EQ(inputs.size(), 2U);
+  CHECK_EQ(outputs.size(), 1U);
+  if (req[0] == kNullOp) return;
+  mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
+  const TShape& dshape = inputs[0].shape_;
+  int N = dshape[0];
+  int C = dshape[1];
+  int P = dshape[2];
+  int K = dshape[3];
+  if (kWriteTo == req[0]) {
+    Fill<true>(s, outputs[0], req[0], 0);
+  }
+  MXNET_NO_INT8_TYPE_SWITCH(inputs[0].type_flag_, DType, {  // output data type switch
+    MSHADOW_TYPE_SWITCH(inputs[1].type_flag_, IType, {  // indices data type switch
+      GatherNNBackwardImpl(N, C, P, K, C*P, P*K,
+                           outputs[0].dptr<DType>(),
+                           inputs[0].dptr<DType>(),
+                           inputs[1].dptr<IType>(),
+                           s);
+    });
+  });
+}
+
+// -----
+
+
 }  // namespace op
 }  // namespace mxnet
 
